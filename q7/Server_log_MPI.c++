@@ -2,138 +2,231 @@
 #include <iostream>
 #include <iomanip>
 #include <vector>
+#include <string>
 #include <unordered_map>
 #include <limits>
 #include <algorithm>
+#include <cstdlib>
 using namespace std;
+
+static inline void skip_ws(const char*& q, const char* e) {
+    while (q < e && (unsigned char)*q <= ' ') ++q;
+}
+static inline long long parse_int(const char*& q, const char* e) {
+    skip_ws(q, e);
+    bool neg = false;
+    if (q < e && (*q == '-' || *q == '+')) { neg = (*q == '-'); ++q; }
+    long long v = 0;
+    while (q < e && *q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); ++q; }
+    return neg ? -v : v;
+}
+static inline double parse_dbl(const char*& q, const char* e) {
+    skip_ws(q, e);
+    char* end;
+    double v = strtod(q, &end);
+    q = end;
+    return v;
+}
 
 int main(int argc, char* argv[])
 {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
     MPI_Init(&argc, &argv);
 
     int rank,p;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD,&p);
 
-    int N,K,S;
-    if(rank==0)
-    {
-        cin >> N >> K >> S;
+    const char* path = (argc > 1) ? argv[1] : nullptr;
 
-    }
-    MPI_Bcast(&N,1,MPI_INT,0,MPI_COMM_WORLD);
-    MPI_Bcast(&K,1,MPI_INT,0,MPI_COMM_WORLD);
-    MPI_Bcast(&S,1,MPI_INT,0,MPI_COMM_WORLD);
-    
+    int N,K,S;
+
     long long total=0, succ=0,fail=0;
     long long bytes_total=0;
     long long s2=0,s3=0,s4=0,s5=0;
     double rt_sum=0.0;
     double rt_min= std::numeric_limits<double>::infinity();
     double rt_max = -std::numeric_limits<double>::infinity();
-    vector<long long> srv_cnt(S,0);
-    vector<double> srv_rtsum(S,0.0);
+    vector<long long> srv_cnt;
+    vector<double> srv_rtsum;
     unordered_map<long long, long long> ep_cnt;
     unordered_map<long long, long long> ep_bytes;
     unordered_map<long long, long long> ivl_cnt;
 
-    const long long CHUNK = 1'000'000;
-    long long done = 0;
-
-    vector<long long> rank_row_counts(p), rank_row_offsets(p);      
-    vector<long long> chunk_ints;                          
-    vector<double>    chunk_response_times;
-    
-    while(done<N)
+    auto accumulate = [&](long long timestamp, long long server_id, long long endpoint_id,
+                          long long status_code, double response_time, long long bytes_sent)
     {
-        long long int m= min(CHUNK, N-done);
+        total += 1;
+        if (status_code < 400) { succ += 1; } else { fail += 1; }
+        rt_sum += response_time;
+        rt_min  = min(rt_min, response_time);
+        rt_max  = max(rt_max, response_time);
+        bytes_total += bytes_sent;
+        switch (status_code / 100) {
+            case 2: s2 += 1; break;
+            case 3: s3 += 1; break;
+            case 4: s4 += 1; break;
+            case 5: s5 += 1; break;
+        }
+        if (server_id >= 0 && server_id < S) {
+            srv_cnt[server_id]   += 1;
+            srv_rtsum[server_id] += response_time;
+        }
+        ep_cnt[endpoint_id]     += 1;
+        ep_bytes[endpoint_id]   += bytes_sent;
+        ivl_cnt[timestamp / 60] += 1;
+    };
 
-        for(int k=0;k<p;k++)
+    if (path)
+    {
+        MPI_File fh;
+        if (MPI_File_open(MPI_COMM_WORLD, path, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh) != MPI_SUCCESS) {
+            if (rank == 0) cerr << "cannot open " << path << "\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        MPI_Offset fsize;
+        MPI_File_get_size(fh, &fsize);
+
+        char hdr[256];
+        MPI_Offset hdr_n = std::min<MPI_Offset>(sizeof(hdr) - 1, fsize);
+        MPI_File_read_at_all(fh, 0, hdr, (int)hdr_n, MPI_CHAR, MPI_STATUS_IGNORE);
+        hdr[hdr_n] = '\0';
+
+        MPI_Offset data_start = 0;
+        while (data_start < hdr_n && hdr[data_start] != '\n') ++data_start;
+        ++data_start;
+
         {
-            rank_row_counts[k]=m/p + (k<m%p ? 1:0);
+            const char* q = hdr; const char* e = hdr + hdr_n;
+            N = (int)parse_int(q, e);
+            K = (int)parse_int(q, e);
+            S = (int)parse_int(q, e);
         }
+        srv_cnt.assign(S, 0);
+        srv_rtsum.assign(S, 0.0);
 
-        rank_row_offsets[0]=0;
-        for(int k=1;k<p;k++)
+        MPI_Offset len = (fsize > data_start) ? fsize - data_start : 0;
+        MPI_Offset lo  = data_start + (MPI_Offset)((len * (long long)rank)     / p);
+        MPI_Offset hi  = data_start + (MPI_Offset)((len * (long long)(rank+1)) / p);
+
+        const MPI_Offset SLACK = 512;
+        MPI_Offset rlo = (rank == 0) ? lo : lo - 1;
+        MPI_Offset rhi = std::min<MPI_Offset>(fsize, hi + SLACK);
+        MPI_Offset rn  = (rhi > rlo) ? rhi - rlo : 0;
+
+        vector<char> buf((size_t)rn + 1);
         {
-            rank_row_offsets[k]=rank_row_offsets[k-1]+ rank_row_counts[k-1];
-        }
-        long long rows_this_rank=rank_row_counts[rank];
-
-        if(rank==0){
-            chunk_ints.assign(m*6,0);
-            chunk_response_times.assign(m,0.0);
-
-            for(long long row=0; row<m; row++)
-            {
-                long long timestamp,server_id,endpoint_id,user_id,status_code,bytes_sent;
-                double response_time;
-                cin >> timestamp >> server_id >> endpoint_id >> user_id >> status_code >> response_time >> bytes_sent;
-
-                chunk_ints[row*6+0] = timestamp;
-                chunk_ints[row*6+1] = server_id;
-                chunk_ints[row*6+2] = endpoint_id;
-                chunk_ints[row*6+3] = user_id;
-                chunk_ints[row*6+4] = status_code;
-                chunk_ints[row*6+5] = bytes_sent;
-                chunk_response_times[row] = response_time;
+            const MPI_Offset STEP = 1 << 28;
+            MPI_Offset maxrn = 0;
+            MPI_Allreduce(&rn, &maxrn, 1, MPI_OFFSET, MPI_MAX, MPI_COMM_WORLD);
+            for (MPI_Offset off = 0; off < maxrn; off += STEP) {
+                MPI_Offset c = std::min<MPI_Offset>(STEP, (rn > off) ? rn - off : 0);
+                MPI_File_read_at_all(fh, rlo + off, buf.data() + off, (int)c, MPI_CHAR, MPI_STATUS_IGNORE);
             }
         }
+        buf[(size_t)rn] = '\0';
+        MPI_File_close(&fh);
 
-        vector<int> ints_send_counts(p),ints_send_offsets(p),rts_send_counts(p),rts_send_offsets(p);
-        for(int k=0;k<p;k++)
+        const char* base = buf.data();
+        const char* e    = buf.data() + rn;
+        const char* q    = base;
+        if (rank != 0) {
+            while (q < e && *q != '\n') ++q;
+            if (q < e) ++q;
+        }
+
+        while (true) {
+            skip_ws(q, e);
+            if (q >= e) break;
+            if (rlo + (MPI_Offset)(q - base) >= hi) break;
+            long long timestamp   = parse_int(q, e);
+            long long server_id   = parse_int(q, e);
+            long long endpoint_id = parse_int(q, e);
+            parse_int(q, e);
+            long long status_code = parse_int(q, e);
+            double    response_time = parse_dbl(q, e);
+            long long bytes_sent  = parse_int(q, e);
+            accumulate(timestamp, server_id, endpoint_id, status_code, response_time, bytes_sent);
+        }
+    }
+    else
+    {
+        if(rank==0)
         {
-            ints_send_counts[k]= (int)(rank_row_counts[k]*6);
-            ints_send_offsets[k]= (int)(rank_row_offsets[k]*6);
-            rts_send_counts[k]= (int)(rank_row_counts[k]);
-            rts_send_offsets[k]= (int)(rank_row_offsets[k]);
+            cin >> N >> K >> S;
         }
+        MPI_Bcast(&N,1,MPI_INT,0,MPI_COMM_WORLD);
+        MPI_Bcast(&K,1,MPI_INT,0,MPI_COMM_WORLD);
+        MPI_Bcast(&S,1,MPI_INT,0,MPI_COMM_WORLD);
+        srv_cnt.assign(S, 0);
+        srv_rtsum.assign(S, 0.0);
 
-        vector<long long> my_ints(rows_this_rank * 6);
-        vector<double>    my_response_times(rows_this_rank);
+        const long long CHUNK = 1'000'000;
+        long long done = 0;
 
-        MPI_Scatterv(rank == 0 ? chunk_ints.data() : nullptr, ints_send_counts.data(), ints_send_offsets.data(), MPI_LONG_LONG, my_ints.data(), (int)(rows_this_rank * 6), MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        MPI_Scatterv(rank == 0 ? chunk_response_times.data() : nullptr, rts_send_counts.data(), rts_send_offsets.data(), MPI_DOUBLE,
-                 my_response_times.data(), (int)rows_this_rank, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        vector<long long> rank_row_counts(p), rank_row_offsets(p);
+        vector<long long> chunk_ints;
+        vector<double>    chunk_response_times;
 
-        for (long long row = 0; row < rows_this_rank; ++row) {
-            long long timestamp   = my_ints[row*6 + 0];
-            long long server_id   = my_ints[row*6 + 1];
-            long long endpoint_id = my_ints[row*6 + 2];
-            long long user_id  = my_ints[row*6 + 3];  
-            long long status_code = my_ints[row*6 + 4];
-            long long bytes_sent  = my_ints[row*6 + 5];
-            double    response_time = my_response_times[row];
-            total += 1;
-            if (status_code < 400) 
+        while(done<N)
+        {
+            long long int m= min(CHUNK, (long long)N-done);
+
+            for(int k=0;k<p;k++)
             {
-                succ += 1; 
-            } 
-            else 
+                rank_row_counts[k]=m/p + (k<m%p ? 1:0);
+            }
+            rank_row_offsets[0]=0;
+            for(int k=1;k<p;k++)
             {
-                fail += 1;
+                rank_row_offsets[k]=rank_row_offsets[k-1]+ rank_row_counts[k-1];
             }
-            
-            rt_sum += response_time;
-            rt_min  = min(rt_min, response_time);
-            rt_max  = max(rt_max, response_time);
-            bytes_total += bytes_sent;
-            switch (status_code / 100) {
-                case 2: s2 += 1; break;
-                case 3: s3 += 1; break;
-                case 4: s4 += 1; break;
-                case 5: s5 += 1; break;
+            long long rows_this_rank=rank_row_counts[rank];
+
+            if(rank==0){
+                chunk_ints.assign(m*6,0);
+                chunk_response_times.assign(m,0.0);
+
+                for(long long row=0; row<m; row++)
+                {
+                    long long timestamp,server_id,endpoint_id,user_id,status_code,bytes_sent;
+                    double response_time;
+                    cin >> timestamp >> server_id >> endpoint_id >> user_id >> status_code >> response_time >> bytes_sent;
+
+                    chunk_ints[row*6+0] = timestamp;
+                    chunk_ints[row*6+1] = server_id;
+                    chunk_ints[row*6+2] = endpoint_id;
+                    chunk_ints[row*6+3] = user_id;
+                    chunk_ints[row*6+4] = status_code;
+                    chunk_ints[row*6+5] = bytes_sent;
+                    chunk_response_times[row] = response_time;
+                }
             }
-            if (server_id >= 0 && server_id < S) {
-                srv_cnt[server_id]   += 1;
-                srv_rtsum[server_id] += response_time;
+
+            vector<int> ints_send_counts(p),ints_send_offsets(p),rts_send_counts(p),rts_send_offsets(p);
+            for(int k=0;k<p;k++)
+            {
+                ints_send_counts[k]= (int)(rank_row_counts[k]*6);
+                ints_send_offsets[k]= (int)(rank_row_offsets[k]*6);
+                rts_send_counts[k]= (int)(rank_row_counts[k]);
+                rts_send_offsets[k]= (int)(rank_row_offsets[k]);
             }
-            ep_cnt[endpoint_id]     += 1;
-            ep_bytes[endpoint_id]   += bytes_sent;
-            ivl_cnt[timestamp / 60] += 1;
+
+            vector<long long> my_ints(rows_this_rank * 6);
+            vector<double>    my_response_times(rows_this_rank);
+
+            MPI_Scatterv(rank == 0 ? chunk_ints.data() : nullptr, ints_send_counts.data(), ints_send_offsets.data(), MPI_LONG_LONG, my_ints.data(), (int)(rows_this_rank * 6), MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+            MPI_Scatterv(rank == 0 ? chunk_response_times.data() : nullptr, rts_send_counts.data(), rts_send_offsets.data(), MPI_DOUBLE,
+                     my_response_times.data(), (int)rows_this_rank, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+            for (long long row = 0; row < rows_this_rank; ++row) {
+                accumulate(my_ints[row*6 + 0], my_ints[row*6 + 1], my_ints[row*6 + 2],
+                           my_ints[row*6 + 4], my_response_times[row], my_ints[row*6 + 5]);
+            }
+            done += m;
         }
-    done += m;
-
     }
 
     //general stats
