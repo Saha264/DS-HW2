@@ -1,0 +1,35 @@
+# Compiled binaries / objects
+*.o
+*.out
+*.exe
+bitonic
+q6_serial
+q6_mpi
+server_log_serial
+server_log_mpi
+
+# Generated benchmark inputs
+q3/input_*.txt
+q6/graph_*.txt
+q7/logs_*.txt
+
+# Generated outputs / metrics
+*_metrics.csv
+*_speedup.png
+*_efficiency.png
+output*.txt
+expected*.txt
+
+# SLURM output
+slurm-*.out
+*.slurm.out
+*.slurm.err
+
+# Python
+__pycache__/
+*.pyc
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
