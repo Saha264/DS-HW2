@@ -44,14 +44,6 @@ Parallel, on 4 processes:
 ```bash
 mpirun -np 4 ./Server_log_MPI < input.txt
 ```
-
-If you request more processes than your machine has cores, add
-`--oversubscribe`:
-
-```bash
-mpirun --oversubscribe -np 8 ./Server_log_MPI < input.txt
-```
-
 To save the output:
 
 ```bash
@@ -122,13 +114,6 @@ mpirun -np 4 ./Server_log_MPI < input.txt > par.txt
 diff seq.txt par.txt && echo "OK"
 ```
 
-
-## Notes
-
-- Records are read and scattered in chunks of 1,000,000 so rank 0 never holds the entire input in memory.
-- Server counts use a dense array of length `S`, reduced in a single
-  `MPI_Reduce`. Endpoint and interval tables are sparse, so they are gathered with `MPI_Gatherv` and merged on rank 0.
-- Top-K selection happens only after the global tables are assembled 
 
 ## Dataset generation and benchmark
 

@@ -75,22 +75,9 @@ print(n); print(' '.join(str(random.randint(-10**9,10**9)) for _ in range(n)))
 mpirun -np 8 ./bitonic < big.txt > out.txt
 ```
 
-Add `--oversubscribe` if `P` exceeds your physical core count (check with
-`nproc`).
+Add `--oversubscribe` if `P` exceeds `nproc`.
 
 ## Running on SLURM
-
-Inside a job allocation use `srun` rather than `mpirun` — it picks up the
-allocation automatically.
-
-### Interactive allocation
-
-```bash
-salloc --nodes=1 --ntasks=8 --time=00:30:00
-srun --ntasks=4 ./bitonic < in.txt
-```
-
-### Batch job
 
 ```bash
 #!/bin/bash
@@ -100,22 +87,10 @@ srun --ntasks=4 ./bitonic < in.txt
 #SBATCH --ntasks=8
 #SBATCH --time=00:30:00
 
-module load gcc openmpi          # adjust to your cluster's module names
+module load gcc openmpi
 mpic++ -Wall -O2 -o bitonic bitonic.c++
 srun --ntasks=4 ./bitonic < in.txt
 ```
-
-Submit with `sbatch bitonic.sbatch`. Your site may also require
-`--partition=` and `--account=` directives.
-
-
-
-## Common mistakes
-
-- **Forgetting the leading `N`.** `echo "1 2 3 4" | mpirun -np 2 ./bitonic`
-  reads `N = 1`, not four elements, and fails the divisibility check.
-- **Only rank 0 reads stdin.** This is what the program assumes, and it is how
-  `mpirun` behaves by default.
 
 ## Correctness and benchmark
 
